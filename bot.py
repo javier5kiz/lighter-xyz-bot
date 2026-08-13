@@ -261,8 +261,11 @@ class HeikinAshiBot:
             f"~${cost:.2f} notional | {config.LEVERAGE}x | Margin: ${margin:.2f}"
         )
 
+        slippage_factor = 1.01 if side == 'long' else 0.99
+        worst_price = int(best_price * slippage_factor)
         result = await self.client.open_position(
             config.MARKET_INDEX, side, base_amount, self.next_order_index(),
+            avg_execution_price=worst_price,
         )
 
         if result['success']:
