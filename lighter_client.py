@@ -259,13 +259,15 @@ class LighterClient:
         )
 
     async def open_position(self, market_index: int, side: str, base_amount: int,
-                            client_order_index: int = 0):
+                            client_order_index: int = 0,
+                            avg_execution_price: int = 0):
         """Open a new position (long or short)."""
         is_buy = side == 'long'
         return await self.market_order(
             market_index=market_index,
             is_buy=is_buy,
             base_amount=base_amount,
+            avg_execution_price=avg_execution_price,
             reduce_only=False,
             client_order_index=client_order_index,
         )
