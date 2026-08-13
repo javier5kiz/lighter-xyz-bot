@@ -236,7 +236,8 @@ class HeikinAshiBot:
         # Price decimals from orderbook
         price_decimals = book.supported_price_decimals
         size_decimals = book.supported_size_decimals
-        min_base = int(book.min_base_amount)
+        # min_base_amount is a decimal string e.g. "0.0050" — float first, then scale
+        min_base = int(float(book.min_base_amount) * (10 ** size_decimals))
         
         # Convert price to human readable
         price = best_price / (10 ** price_decimals) if best_price > 0 else 0
