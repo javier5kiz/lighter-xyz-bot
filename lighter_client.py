@@ -116,9 +116,11 @@ class LighterClient:
                 set_timestamp_to_end=True,
             )
             
-            if resp and resp.candles:
+            # resp.c is the correct field for Candle list in lighter-sdk Candles model
+            candle_list = resp.c if resp else None
+            if candle_list:
                 candles = []
-                for c in resp.candles:
+                for c in candle_list:
                     candles.append({
                         'timestamp': int(c.t) // 1000,  # ms to seconds
                         'open': float(c.o),
