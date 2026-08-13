@@ -15,9 +15,9 @@ PRIVATE_KEY = __import__('os').environ.get('LIGHTER_PRIVATE_KEY', '')
 MARKET_INDEX = 0          # 0 = ETH perps (check orderBookDetails for others)
 TIMEFRAME = "1m"          # 1-minute candles
 LEVERAGE = 30             # 30x leverage
-INITIAL_MARGIN_USD = 0.5  # $0.5 margin per trade (position size = margin * leverage * price)
-MAX_MARGIN_USD = 1.0      # max margin per trade ($1)
-MAX_LOSS_USD = 0.5        # close position if unrealized loss exceeds this
+INITIAL_MARGIN_USD = 1.26  # $0.5 margin per trade (position size = margin * leverage * price)
+MAX_MARGIN_USD = 2.0      # max margin per trade ($1)
+MAX_LOSS_USD = 1.0        # close position if unrealized loss exceeds this
 MIN_TRADE_INTERVAL = 60  # minimum seconds between trades (1 candle)
 
 # ── Heikin Ashi Strategy ──────────────────────────────────────
