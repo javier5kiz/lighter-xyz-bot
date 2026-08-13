@@ -130,7 +130,7 @@ class HeikinAshiBot:
             now = time.time()
 
             # 1. Fetch candles
-            candles = await self.client.get_candles(config.MARKET_INDEX, config.TIMEFRAME, limit=20)
+            candles = await self.client.get_candles(config.MARKET_INDEX, "1m", limit=20)
             if not candles or len(candles) < 2:
                 return
 
@@ -176,7 +176,7 @@ class HeikinAshiBot:
             # 6. Heartbeat
             if now - self.stats.last_heartbeat >= config.HEARTBEAT_INTERVAL:
                 self.stats.last_heartbeat = now
-                self._heartbeat()
+                await self._heartbeat()
 
         except Exception as e:
             logger.error(f"Tick error: {e}")
@@ -184,7 +184,7 @@ class HeikinAshiBot:
 
     async def _handle_signal(self, signal: str):
         """Handle a new HA signal — reverse or open position."""
-        # Check current position
+        # Refresh position from API
         self.current_position = await self.client.get_position(config.MARKET_INDEX)
 
         if self.current_position:
@@ -223,9 +223,23 @@ class HeikinAshiBot:
 
     async def _open_position(self, side: str):
         """Open a new position in the given direction."""
-        # Get current price for sizing
-        best_bid, best_ask = await self.client.get_best_price(config.MARKET_INDEX)
-        price = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
+        # Get orderbook for sizing info
+        book = await self.client.get_orderbook(config.MARKET_INDEX)
+        if not book:
+            logger.error("No orderbook data — cannot size order")
+            return
+
+        # Get best price from signer (returns int scaled by price decimals)
+        is_ask = side == 'short'  # short = sell = ask side
+        best_price = await self.client.get_best_price(config.MARKET_INDEX, is_ask=(not (side == 'long')))
+        
+        # Price decimals from orderbook
+        price_decimals = book.supported_price_decimals
+        size_decimals = book.supported_size_decimals
+        min_base = int(book.min_base_amount)
+        
+        # Convert price to human readable
+        price = best_price / (10 ** price_decimals) if best_price > 0 else 0
         if price <= 0:
             logger.error("No price data — cannot size order")
             return
@@ -233,18 +247,16 @@ class HeikinAshiBot:
         # Position sizing: margin * leverage / price
         margin = config.INITIAL_MARGIN_USD
         notional = margin * config.LEVERAGE  # $0.5 * 30x = $15 notional
-        base_amount_raw = notional / price  # e.g., $15 / $2500 = 0.006 ETH
+        base_amount_raw = notional / price
 
-        # Convert to integer base units (lighter uses integer amounts)
-        # Need to get size decimals from orderbook details
-        # For now, assume 3 decimals (0.001 ETH = 1 base unit)
-        base_amount = int(base_amount_raw * 1000)
-        if base_amount < 1:
-            base_amount = 1
+        # Convert to integer base units (scaled by size decimals)
+        base_amount = int(base_amount_raw * (10 ** size_decimals))
+        if base_amount < min_base:
+            base_amount = min_base
 
-        cost = base_amount / 1000 * price
+        cost = base_amount / (10 ** size_decimals) * price
         logger.info(
-            f"🎯 OPEN {side.upper()} | Size: {base_amount/1000:.4f} ({base_amount} units) | "
+            f"🎯 OPEN {side.upper()} | Size: {base_amount / (10 ** size_decimals):.6f} ({base_amount} units) | "
             f"~${cost:.2f} notional | {config.LEVERAGE}x | Margin: ${margin:.2f}"
         )
 
@@ -269,7 +281,12 @@ class HeikinAshiBot:
         if not self.current_position:
             return
 
-        unrealized = await self._calculate_unrealized_pnl(self.current_position)
+        # Refresh position to get latest unrealized PnL
+        self.current_position = await self.client.get_position(config.MARKET_INDEX)
+        if not self.current_position:
+            return
+
+        unrealized = self.current_position.get('unrealized_pnl', 0.0)
         if unrealized < -config.MAX_LOSS_USD:
             logger.warning(
                 f"🛑 MAX LOSS triggered: unrealized ${unrealized:.4f} < "
@@ -288,36 +305,12 @@ class HeikinAshiBot:
             self.current_position = None
 
     async def _calculate_unrealized_pnl(self, position: dict) -> float:
-        """Estimate unrealized PnL for an open position."""
-        best_bid, best_ask = await self.client.get_best_price(config.MARKET_INDEX)
-        if not best_bid or not best_ask:
-            return 0
-
-        mark = (best_bid + best_ask) / 2
-        entry = position['entry_price']
-        size = abs(position['size'])
-
-        if position['side'] == 'long':
-            return (mark - entry) * size
-        else:
-            return (entry - mark) * size
+        """Get unrealized PnL from API (already calculated by Lighter)."""
+        return position.get('unrealized_pnl', 0.0)
 
     async def _calculate_realized_pnl(self, position: dict) -> float:
-        """Calculate realized PnL for a just-closed position."""
-        # After closing, get the fill price from the close order
-        # For simplicity, use current mark price as approximate fill
-        best_bid, best_ask = await self.client.get_best_price(config.MARKET_INDEX)
-        if not best_bid or not best_ask:
-            return 0
-
-        exit_price = (best_bid + best_ask) / 2
-        entry = position['entry_price']
-        size = abs(position['size'])
-
-        if position['side'] == 'long':
-            return (exit_price - entry) * size
-        else:
-            return (entry - exit_price) * size
+        """Calculate realized PnL from the position's unrealized PnL at close time."""
+        return position.get('unrealized_pnl', 0.0)
 
     def _record_trade(self, pnl: float):
         """Record a completed trade."""
@@ -328,18 +321,18 @@ class HeikinAshiBot:
         else:
             self.stats.losses += 1
 
-    def _heartbeat(self):
+    async def _heartbeat(self):
         """Print running stats."""
-        balance = 0
         pos_str = "FLAT"
-        unrealized = 0
+        unrealized = 0.0
 
         if self.current_position:
-            unrealized = asyncio.ensure_future(self._calculate_unrealized_pnl(self.current_position))
-            pos_str = f"{self.current_position['side'].upper()} @ {self.current_position['entry_price']:.2f}"
+            unrealized = self.current_position.get('unrealized_pnl', 0.0)
+            pos_str = f"{self.current_position['side'].upper()} @ {self.current_position['entry_price']:.2f} (uPnL: ${unrealized:.4f})"
 
+        balance = await self.client.get_balance()
         sign = '+' if self.stats.total_pnl >= 0 else ''
-        logger.info(f"💓 {self.stats.summary()}")
+        logger.info(f"💓 {self.stats.summary()} | Balance: ${balance:.2f}")
         logger.info(
             f"   Position: {pos_str} | "
             f"Candles: {self.stats.candles_checked} | "

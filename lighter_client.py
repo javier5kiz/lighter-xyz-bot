@@ -3,15 +3,16 @@ lighter_client.py — Wrapper around the Lighter SDK
 
 Handles:
 - Connection to Lighter testnet/mainnet
-- Fetching candle data (OHLCV)
-- Account info (balance, positions)
-- Placing market orders (long/short)
+- Fetching candle data (OHLCV) via CandlestickApi
+- Account info (balance, positions) via AccountApi
+- Placing market orders via SignerClient
 - Closing positions
-- Leverage setting
+- Setting leverage
 """
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 try:
@@ -67,149 +68,140 @@ class LighterClient:
         return resp
 
     async def get_orderbook(self, market_index: int):
-        """Get current orderbook (best bid/ask)."""
+        """Get current orderbook metadata (fees, min sizes)."""
         api = lighter.OrderApi(self._api)
-        resp = await api.order_books(market_ids=[market_index])
-        return resp[0] if resp else None
+        resp = await api.order_books(market_id=market_index)
+        if resp and resp.order_books:
+            return resp.order_books[0]
+        return None
 
-    async def get_best_price(self, market_index: int) -> tuple[float, float]:
-        """Returns (best_bid, best_ask) for the market."""
-        book = await self.get_orderbook(market_index)
-        if not book:
-            return 0, 0
-        # Parse orderbook — structure varies, extract best bid/ask
-        bids = getattr(book, 'bids', [])
-        asks = getattr(book, 'asks', [])
-        best_bid = float(bids[0].price) if bids else 0
-        best_ask = float(asks[0].price) if asks else 0
-        return best_bid, best_ask
-
-    async def get_candles(self, market_index: int, interval: str = "1m", limit: int = 100) -> list[dict]:
+    async def get_best_price(self, market_index: int, is_ask: bool) -> int:
         """
-        Fetch recent candles for Heikin Ashi calculation.
-        Uses Lighter's marketPriceCharts or recentTrades endpoint.
-        Falls back to constructing candles from trades if needed.
+        Get best bid or ask price from orderbook.
+        Uses SignerClient.get_best_price which queries the orderbook.
+        Returns price as integer (scaled by market's price decimals).
         """
         try:
-            api = lighter.OrderApi(self._api)
-            # Try market price charts endpoint
-            resp = await api.market_price_charts(
+            price = await self._signer.get_best_price(market_index, is_ask)
+            return price
+        except Exception as e:
+            logger.error(f"get_best_price error: {e}")
+            return 0
+
+    async def get_candles(self, market_index: int, resolution: str = "1m", limit: int = 100) -> list[dict]:
+        """
+        Fetch candles via CandlestickApi.
+        
+        Args:
+            market_index: market ID
+            resolution: candle resolution ("1m", "5m", "1h", etc.)
+            limit: max candles to fetch
+            
+        Returns:
+            list of dicts: {timestamp, open, high, low, close, volume}
+        """
+        try:
+            api = lighter.CandlestickApi(self._api)
+            now_ms = int(time.time() * 1000)
+            # Start timestamp: go back enough to get `limit` candles
+            # For 1m candles, each candle = 60000ms, so go back limit*60000 + buffer
+            start_ms = now_ms - (limit + 5) * 60_000
+            
+            resp = await api.candles(
                 market_id=market_index,
-                interval=interval,
-                limit=limit,
+                resolution=resolution,
+                start_timestamp=start_ms,
+                end_timestamp=now_ms,
+                count_back=limit,
+                set_timestamp_to_end=True,
             )
-            if resp and hasattr(resp, 'candles') and resp.candles:
+            
+            if resp and resp.candles:
                 candles = []
                 for c in resp.candles:
                     candles.append({
-                        'timestamp': int(getattr(c, 'time', 0)),
-                        'open': float(getattr(c, 'open', 0)),
-                        'high': float(getattr(c, 'high', 0)),
-                        'low': float(getattr(c, 'low', 0)),
-                        'close': float(getattr(c, 'close', 0)),
-                        'volume': float(getattr(c, 'volume', 0)),
+                        'timestamp': int(c.t) // 1000,  # ms to seconds
+                        'open': float(c.o),
+                        'high': float(c.h),
+                        'low': float(c.l),
+                        'close': float(c.c),
+                        'volume': float(c.v),
                     })
                 return candles
         except Exception as e:
-            logger.debug(f"marketPriceCharts failed: {e}")
-
-        # Fallback: fetch recent trades and aggregate
-        return await self._candles_from_trades(market_index, limit)
-
-    async def _candles_from_trades(self, market_index: int, limit: int) -> list[dict]:
-        """Build candles from recent trades as fallback."""
-        try:
-            api = lighter.OrderApi(self._api)
-            resp = await api.recent_trades(market_id=market_index, limit=500)
-            trades = getattr(resp, 'trades', []) or []
-
-            if not trades:
-                return []
-
-            # Aggregate into 1-minute candles
-            candles = {}
-            for t in trades:
-                ts = int(getattr(t, 'time', 0))
-                minute_ts = (ts // 60) * 60
-                price = float(getattr(t, 'price', 0))
-                size = float(getattr(t, 'size', 0))
-
-                if minute_ts not in candles:
-                    candles[minute_ts] = {
-                        'timestamp': minute_ts,
-                        'open': price,
-                        'high': price,
-                        'low': price,
-                        'close': price,
-                        'volume': size,
-                    }
-                else:
-                    c = candles[minute_ts]
-                    c['high'] = max(c['high'], price)
-                    c['low'] = min(c['low'], price)
-                    c['close'] = price
-                    c['volume'] += size
-
-            return sorted(candles.values(), key=lambda x: x['timestamp'])[-limit:]
-        except Exception as e:
-            logger.error(f"Failed to build candles from trades: {e}")
-            return []
+            logger.error(f"get_candles error: {e}")
+        
+        return []
 
     # ── Account ───────────────────────────────────────────────
 
     async def get_account(self):
-        """Get account info (balance, positions, margin)."""
+        """Get account info by index."""
         api = lighter.AccountApi(self._api)
-        resp = await api.account(index=self.account_index)
-        return resp
+        resp = await api.account(by="index", value=str(self.account_index))
+        if resp and resp.accounts and len(resp.accounts) > 0:
+            return resp.accounts[0]
+        return None
 
     async def get_balance(self) -> float:
         """Get available USDC balance."""
         account = await self.get_account()
-        # Balance structure varies — try common fields
-        for field in ['collateral', 'balance', 'available_collateral', 'free_collateral']:
-            val = getattr(account, field, None)
-            if val is not None:
-                return float(val)
-        # Try nested
-        if hasattr(account, 'margin_info'):
-            return float(getattr(account.margin_info, 'free_collateral', 0))
-        return 0.0
+        if not account:
+            return 0.0
+        # available_balance is a string like "100.5"
+        try:
+            return float(account.available_balance)
+        except (ValueError, TypeError):
+            return 0.0
 
     async def get_position(self, market_index: int) -> Optional[dict]:
         """Get current position for a market. Returns None if no position."""
         try:
             account = await self.get_account()
-            positions = getattr(account, 'positions', []) or []
+            if not account or not account.positions:
+                return None
 
-            for pos in positions:
-                if int(getattr(pos, 'market_id', -1)) == market_index:
-                    size = float(getattr(pos, 'base_amount', 0))
+            for pos in account.positions:
+                if int(pos.market_id) == market_index:
+                    size = float(pos.position)
                     if abs(size) < 1e-10:
                         continue
                     return {
                         'market_index': market_index,
-                        'size': size,  # positive = long, negative = short
-                        'entry_price': float(getattr(pos, 'entry_price', 0)),
-                        'side': 'long' if size > 0 else 'short',
+                        'size': size,
+                        'entry_price': float(pos.avg_entry_price),
+                        'side': 'long' if pos.sign > 0 else 'short',
+                        'unrealized_pnl': float(pos.unrealized_pnl),
+                        'allocated_margin': float(pos.allocated_margin),
                     }
         except Exception as e:
             logger.debug(f"get_position error: {e}")
         return None
 
+    async def get_unrealized_pnl(self, market_index: int) -> float:
+        """Get unrealized PnL for a market position."""
+        pos = await self.get_position(market_index)
+        if pos:
+            return pos['unrealized_pnl']
+        return 0.0
+
     # ── Leverage ──────────────────────────────────────────────
 
-    async def set_leverage(self, market_index: int, leverage: int):
-        """Set leverage for a market."""
+    async def set_leverage(self, market_index: int, leverage: int,
+                           margin_mode: int = None):
+        """Set leverage for a market. margin_mode: 1=ISOLATED, 0=CROSS."""
+        if margin_mode is None:
+            margin_mode = lighter.SignerClient.ISOLATED_MARGIN_MODE
         try:
             tx, tx_hash, err = await self._signer.update_leverage(
                 market_index=market_index,
+                margin_mode=margin_mode,
                 leverage=leverage,
             )
             if err:
                 logger.error(f"Set leverage failed: {err}")
             else:
-                logger.info(f"Leverage set to {leverage}x for market {market_index}")
+                logger.info(f"Leverage set to {leverage}x (margin_mode={margin_mode}) for market {market_index}")
             return err is None
         except Exception as e:
             logger.error(f"Set leverage exception: {e}")
@@ -218,28 +210,27 @@ class LighterClient:
     # ── Orders ─────────────────────────────────────────────────
 
     async def market_order(self, market_index: int, is_buy: bool, base_amount: int,
+                           avg_execution_price: int = 0,
                            reduce_only: bool = False, client_order_index: int = 0):
         """
-        Place a market order.
+        Place a market order via create_market_order.
         
         Args:
             market_index: market to trade
             is_buy: True for buy/long, False for sell/short
             base_amount: size in base units (int, scaled by market decimals)
+            avg_execution_price: worst acceptable price (0 = accept any)
             reduce_only: True to only reduce existing position
             client_order_index: unique order ID for tracking
         """
         try:
-            tx, tx_hash, err = await self._signer.create_order(
+            tx, tx_hash, err = await self._signer.create_market_order(
                 market_index=market_index,
                 client_order_index=client_order_index,
                 base_amount=base_amount,
-                price=0,  # market order — worst acceptable price = 0 means accept any
-                is_ask=not is_buy,  # ask = sell, bid = buy
-                order_type=self._signer.ORDER_TYPE_MARKET,
-                time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                avg_execution_price=avg_execution_price,
+                is_ask=not is_buy,
                 reduce_only=reduce_only,
-                order_expiry=self._signer.DEFAULT_IOC_EXPIRY,
             )
 
             if err:
