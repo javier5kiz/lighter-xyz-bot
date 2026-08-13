@@ -245,15 +245,23 @@ class LighterClient:
             logger.error(f"Order exception: {e}")
             return {'success': False, 'error': str(e)}
 
-    async def close_position(self, market_index: int, position: dict, client_order_index: int = 0):
+    async def close_position(self, market_index: int, position: dict,
+                            client_order_index: int = 0,
+                            size_decimals: int = 2):
         """Close an existing position with a reduce-only market order."""
-        is_buy = position['size'] < 0  # close short = buy, close long = sell
-        base_amount = abs(int(position['size']))
-
+        is_buy = position["size"] < 0  # close short = buy, close long = sell
+        base_amount = int(abs(position["size"]) * (10 ** size_decimals))
+        try:
+            raw_price = await self._signer.get_best_price(market_index, is_ask=(not is_buy))
+        except Exception:
+            raw_price = 1
+        slippage = 1.01 if is_buy else 0.99
+        worst_price = max(1, int(raw_price * slippage))
         return await self.market_order(
             market_index=market_index,
             is_buy=is_buy,
             base_amount=base_amount,
+            avg_execution_price=worst_price,
             reduce_only=True,
             client_order_index=client_order_index,
         )
