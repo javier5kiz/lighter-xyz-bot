@@ -1,15 +1,6 @@
 """
-bot.py — Lighter.xyz Heikin Ashi Bot
-
-Strategy:
-  - 1-minute Heikin Ashi candles
-  - HA candle closes GREEN → close any short, open LONG
-  - HA candle closes RED → close any long, open SHORT
-  - 30x leverage, $0.5-$1 margin per trade
-  - Position reverses on opposite signal
-  - Max loss closes position
-
-Lighter Exchange = zero fees, so this works clean.
+bot.py — Heikin Ashi Bot adapted to use OKX client instead of Lighter
+Only minimal changes were made to swap the exchange client and environment variable checks.
 """
 
 import asyncio
@@ -20,7 +11,7 @@ from typing import Optional
 
 import config
 from heikin_ashi import HeikinAshi
-from lighter_client import LighterClient
+from okx_client import OkxClient
 
 # ── Logging Setup ──────────────────────────────────────────────
 logging.basicConfig(
@@ -67,7 +58,7 @@ class HeikinAshiBot:
     def __init__(self):
         self.ha = HeikinAshi()
         self.stats = Stats()
-        self.client: Optional[LighterClient] = None
+        self.client: Optional[OkxClient] = None
         self.current_position: Optional[dict] = None
         self.order_counter = 0
         self.last_candle_time = 0
@@ -83,22 +74,22 @@ class HeikinAshiBot:
         self._print_banner()
 
         # Validate config
-        if not config.PRIVATE_KEY:
-            logger.error("LIGHTER_PRIVATE_KEY not set. Add your Lighter API private key.")
-            logger.error("Get it from: https://lighter.xyz → Settings → API Keys")
+        if not config.OKX_API_KEY or not config.OKX_SECRET or not config.OKX_PASSPHRASE:
+            logger.error("OKX API credentials not set. Set OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE environment variables.")
             return
 
         # Connect
-        self.client = LighterClient(
-            base_url=config.BASE_URL,
-            api_key_index=config.API_KEY_INDEX,
-            account_index=config.ACCOUNT_INDEX,
-            private_key=config.PRIVATE_KEY,
+        self.client = OkxClient(
+            api_key=config.OKX_API_KEY,
+            secret=config.OKX_SECRET,
+            passphrase=config.OKX_PASSPHRASE,
+            testnet=config.OKX_TESTNET,
+            market=config.MARKET,
         )
         await self.client.connect()
 
-        # Set leverage
-        await self.client.set_leverage(config.MARKET_INDEX, config.LEVERAGE)
+        # Set leverage (adapter is a no-op currently)
+        await self.client.set_leverage(config.MARKET, config.LEVERAGE)
 
         # Check balance
         balance = await self.client.get_balance()
@@ -109,8 +100,8 @@ class HeikinAshiBot:
             return
 
         # Get market details
-        book_details = await self.client.get_orderbook_details(config.MARKET_INDEX)
-        logger.info(f"📈 Market {config.MARKET_INDEX} ready")
+        book_details = await self.client.get_orderbook_details(config.MARKET)
+        logger.info(f"📈 Market {config.MARKET} ready")
 
         logger.info("🚀 Bot started. Waiting for 1-min HA candle closes...\n")
 
@@ -131,14 +122,13 @@ class HeikinAshiBot:
             now = time.time()
 
             # 1. Fetch candles
-            candles = await self.client.get_candles(config.MARKET_INDEX, "1m", limit=20)
+            candles = await self.client.get_candles(config.MARKET, "1m", limit=20)
             if not candles or len(candles) < 2:
                 return
 
             self.stats.candles_checked += 1
 
             # 2. Get latest CLOSED candle (skip the still-forming one)
-            # A candle is "closed" if its timestamp + 60s < now
             closed_candles = [c for c in candles if c['timestamp'] + 60 <= now]
             if not closed_candles:
                 return
@@ -186,7 +176,7 @@ class HeikinAshiBot:
     async def _handle_signal(self, signal: str):
         """Handle a new HA signal — reverse or open position."""
         # Refresh position from API
-        self.current_position = await self.client.get_position(config.MARKET_INDEX)
+        self.current_position = await self.client.get_position(config.MARKET)
 
         if self.current_position:
             pos_side = self.current_position['side']
@@ -202,13 +192,13 @@ class HeikinAshiBot:
 
             # Close current position
             close_result = await self.client.close_position(
-                config.MARKET_INDEX,
+                config.MARKET,
                 self.current_position,
                 self.next_order_index(),
                 size_decimals=self.size_decimals,
             )
 
-            if close_result['success']:
+            if close_result.get('success'):
                 # Calculate realized PnL
                 pnl = await self._calculate_realized_pnl(self.current_position)
                 self._record_trade(pnl)
@@ -226,22 +216,22 @@ class HeikinAshiBot:
     async def _open_position(self, side: str):
         """Open a new position in the given direction."""
         # Get orderbook for sizing info
-        book = await self.client.get_orderbook(config.MARKET_INDEX)
+        book = await self.client.get_orderbook(config.MARKET)
         if not book:
             logger.error("No orderbook data — cannot size order")
             return
 
         # Get best price from signer (returns int scaled by price decimals)
         is_ask = side == 'short'  # short = sell = ask side
-        best_price = await self.client.get_best_price(config.MARKET_INDEX, is_ask=(not (side == 'long')))
-        
+        best_price = await self.client.get_best_price(config.MARKET, is_ask=is_ask)
+
         # Price decimals from orderbook
-        price_decimals = book.supported_price_decimals
-        size_decimals = book.supported_size_decimals
+        price_decimals = getattr(book, 'supported_price_decimals', 8)
+        size_decimals = getattr(book, 'supported_size_decimals', 8)
         self.size_decimals = size_decimals  # cache for close_position
         # min_base_amount is a decimal string e.g. "0.0050" — float first, then scale
         min_base = int(float(book.min_base_amount) * (10 ** size_decimals))
-        
+
         # Convert price to human readable
         price = best_price / (10 ** price_decimals) if best_price > 0 else 0
         if price <= 0:
@@ -267,11 +257,11 @@ class HeikinAshiBot:
         slippage_factor = 1.01 if side == 'long' else 0.99
         worst_price = int(best_price * slippage_factor)
         result = await self.client.open_position(
-            config.MARKET_INDEX, side, base_amount, self.next_order_index(),
+            config.MARKET, side, base_amount, self.next_order_index(),
             avg_execution_price=worst_price,
         )
 
-        if result['success']:
+        if result.get('success'):
             logger.info(f"   ✅ Opened {side} at market")
             if side == 'long':
                 self.stats.long_trades += 1
@@ -289,7 +279,7 @@ class HeikinAshiBot:
             return
 
         # Refresh position to get latest unrealized PnL
-        self.current_position = await self.client.get_position(config.MARKET_INDEX)
+        self.current_position = await self.client.get_position(config.MARKET)
         if not self.current_position:
             return
 
@@ -300,12 +290,12 @@ class HeikinAshiBot:
                 f"-${config.MAX_LOSS_USD}"
             )
             result = await self.client.close_position(
-                config.MARKET_INDEX,
+                config.MARKET,
                 self.current_position,
                 self.next_order_index(),
                 size_decimals=self.size_decimals,
             )
-            if result['success']:
+            if result.get('success'):
                 pnl = await self._calculate_realized_pnl(self.current_position)
                 self._record_trade(pnl)
                 self.stats.max_loss_closes += 1
@@ -313,7 +303,7 @@ class HeikinAshiBot:
             self.current_position = None
 
     async def _calculate_unrealized_pnl(self, position: dict) -> float:
-        """Get unrealized PnL from API (already calculated by Lighter)."""
+        """Get unrealized PnL from API (already calculated by exchange)."""
         return position.get('unrealized_pnl', 0.0)
 
     async def _calculate_realized_pnl(self, position: dict) -> float:
@@ -349,10 +339,10 @@ class HeikinAshiBot:
 
     def _print_banner(self):
         print("\n" + "═" * 60)
-        print("  LIGHTER.XYZ HEIKIN ASHI BOT")
+        print("  OKX DEMO HEIKIN ASHI BOT")
         print("═" * 60)
-        print(f"  Network: {'TESTNET' if 'testnet' in config.BASE_URL else 'MAINNET'}")
-        print(f"  Market:  {config.MARKET_INDEX} (0=ETH perps)")
+        print(f"  Network: {'TESTNET' if config.OKX_TESTNET else 'MAINNET'}")
+        print(f"  Market:  {config.MARKET}")
         print(f"  Strategy: HA 1m — green→long, red→short")
         print(f"  Leverage: {config.LEVERAGE}x")
         print(f"  Margin: ${config.INITIAL_MARGIN_USD}-{config.MAX_MARGIN_USD} per trade")

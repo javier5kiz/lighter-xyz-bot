@@ -1,28 +1,29 @@
 """
-config.py — Lighter.xyz Heikin Ashi Bot Configuration
+config.py — OKX demo configuration (replaces Lighter settings)
 """
+import os
 
-# ── Lighter Exchange ──────────────────────────────────────────
-BASE_URL = "https://testnet.zklighter.elliot.ai"  # testnet
-# BASE_URL = "https://mainnet.zklighter.elliot.ai"  # mainnet
+# OKX API credentials (set as environment variables)
+OKX_API_KEY = os.environ.get('OKX_API_KEY', '')
+OKX_SECRET = os.environ.get('OKX_SECRET', '')
+OKX_PASSPHRASE = os.environ.get('OKX_PASSPHRASE', '')
+OKX_TESTNET = os.environ.get('OKX_TESTNET', 'true').lower() in ('1', 'true', 'yes')
 
-# Your Lighter API credentials (from lighter.xyz dashboard)
-API_KEY_INDEX = int(__import__('os').environ.get('LIGHTER_API_KEY_INDEX', '2'))
-ACCOUNT_INDEX = int(__import__('os').environ.get('LIGHTER_ACCOUNT_INDEX', '0'))
-PRIVATE_KEY = __import__('os').environ.get('LIGHTER_PRIVATE_KEY', '')
+# Market symbol used by ccxt/OKX (change if you prefer another instrument)
+# Examples: 'ETH/USDT', 'BTC/USDT'
+MARKET = os.environ.get('MARKET', 'ETH/USDT')
 
-# ── Trading Config ────────────────────────────────────────────
-MARKET_INDEX = 0          # 0 = ETH perps (check orderBookDetails for others)
+# ── Trading Config (unchanged strategy parameters) ────────────
 TIMEFRAME = "1m"          # 1-minute candles
-LEVERAGE = 30             # 30x leverage
-INITIAL_MARGIN_USD = 1.26  # $0.5 margin per trade (position size = margin * leverage * price)
-MAX_MARGIN_USD = 2.0      # max margin per trade ($1)
-MAX_LOSS_USD = 1.0        # close position if unrealized loss exceeds this
-MIN_TRADE_INTERVAL = 60  # minimum seconds between trades (1 candle)
+LEVERAGE = 30               # 30x leverage (bot will request it; set in exchange if needed)
+INITIAL_MARGIN_USD = 1.26   # initial margin per trade
+MAX_MARGIN_USD = 2.0
+MAX_LOSS_USD = 1.0
+MIN_TRADE_INTERVAL = 60
 
 # ── Heikin Ashi Strategy ──────────────────────────────────────
 # Entry: HA candle closes green → long, red → short
 # Exit: opposite signal closes current position and reverses
 
 # ── Heartbeat ─────────────────────────────────────────────────
-HEARTBEAT_INTERVAL = 30  # print stats every 30 seconds
+HEARTBEAT_INTERVAL = 30
