@@ -72,6 +72,7 @@ class HeikinAshiBot:
         self.order_counter = 0
         self.last_candle_time = 0
         self.last_trade_time = 0
+        self.size_decimals = 2  # cached from orderbook; used by close_position
 
     def next_order_index(self) -> int:
         self.order_counter += 1
@@ -204,6 +205,7 @@ class HeikinAshiBot:
                 config.MARKET_INDEX,
                 self.current_position,
                 self.next_order_index(),
+                size_decimals=self.size_decimals,
             )
 
             if close_result['success']:
@@ -236,6 +238,7 @@ class HeikinAshiBot:
         # Price decimals from orderbook
         price_decimals = book.supported_price_decimals
         size_decimals = book.supported_size_decimals
+        self.size_decimals = size_decimals  # cache for close_position
         # min_base_amount is a decimal string e.g. "0.0050" — float first, then scale
         min_base = int(float(book.min_base_amount) * (10 ** size_decimals))
         
@@ -300,6 +303,7 @@ class HeikinAshiBot:
                 config.MARKET_INDEX,
                 self.current_position,
                 self.next_order_index(),
+                size_decimals=self.size_decimals,
             )
             if result['success']:
                 pnl = await self._calculate_realized_pnl(self.current_position)
